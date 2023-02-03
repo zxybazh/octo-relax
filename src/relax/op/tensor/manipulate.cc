@@ -77,7 +77,7 @@ StructInfo InferStructInfoBroadcastTo(const Call& call, const BlockBuilder& ctx)
     return TensorStructInfo(/*shape=*/call->args[1], data_sinfo->dtype);
   }
 
-  arith::Analyzer* analyzer = ctx->GetAnalyzer();
+  // arith::Analyzer* analyzer = ctx->GetAnalyzer();
   Array<PrimExpr> old_shape_value = shape_sinfo->values.value();
   Array<PrimExpr> tgt_shape_value = tgt_shape_sinfo->values.value();
   int old_ndim = old_shape_value.size();
@@ -88,21 +88,22 @@ StructInfo InferStructInfoBroadcastTo(const Call& call, const BlockBuilder& ctx)
     const auto* old_len_int = old_len.as<IntImmNode>();
     if (old_len_int != nullptr && old_len_int->value == 1) {
       continue;
-    } else if (!analyzer->CanProveEqual(old_len, tgt_len)) {
-      // We would like to ensure safety, and therefore placed a stronger requirement for user to
-      // use MatchCast.
-      // Todo(relax-team): At this moment, enforcing MatchCast is fine. But we may need to revisit
-      // this requirement to reduce the workload of importers and better support dynamic shapes.
-      ctx->ReportFatal(
-          Diagnostic::Error(call)
-          << "broadcast_to expects the input tensor shape is broadcastable to the target shape. "
-             "The target shape at dim "
-          << tgt_ndim - i - 1 << " is " << tgt_len << " while the input tensor shape at dim "
-          << old_ndim - i - 1 << " is " << old_len
-          << ", where the broadcastability cannot be determined at compile-time. If the old shape"
-             "at this dim is symbolic and will be 1 at runtime, to ensure safety, please use "
-             "MatchCast to explicitly make the shape at this dimension be static 1.");
     }
+    // else if (!analyzer->CanProveEqual(old_len, tgt_len)) {
+    //  // We would like to ensure safety, and therefore placed a stronger requirement for user to
+    //  // use MatchCast.
+    //  // Todo(relax-team): At this moment, enforcing MatchCast is fine. But we may need to revisit
+    //  // this requirement to reduce the workload of importers and better support dynamic shapes.
+    //  ctx->ReportFatal(
+    //      Diagnostic::Error(call)
+    //      << "broadcast_to expects the input tensor shape is broadcastable to the target shape. "
+    //         "The target shape at dim "
+    //      << tgt_ndim - i - 1 << " is " << tgt_len << " while the input tensor shape at dim "
+    //      << old_ndim - i - 1 << " is " << old_len
+    //      << ", where the broadcastability cannot be determined at compile-time. If the old shape"
+    //         "at this dim is symbolic and will be 1 at runtime, to ensure safety, please use "
+    //         "MatchCast to explicitly make the shape at this dimension be static 1.");
+    //}
   }
   return TensorStructInfo(/*shape=*/call->args[1], data_sinfo->dtype);
 }
