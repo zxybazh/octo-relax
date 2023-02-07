@@ -138,7 +138,7 @@ class MatMul(OnnxOpConverter):
 
     @classmethod
     def _impl_v13(cls, bb, inputs, attr):
-        return bb.emit_te(topi.matmul, inputs[0], inputs[1])
+        return bb.emit(relax.op.linear_algebra.matmul(inputs[0], inputs[1]))
 
 
 class Div(OnnxOpConverter):
@@ -682,7 +682,7 @@ class Expand(OnnxOpConverter):
 
 def _get_convert_map(opset):
     return {
-        "MatMul": relay.frontend.onnx.MatMul,
+        "MatMul": MatMul,
         "Concat": Concat,
         "Add": Add,
         "Mul": Mul,
