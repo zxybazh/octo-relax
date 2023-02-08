@@ -255,16 +255,25 @@ class Gemm(OnnxOpConverter):
         # Compute Y = alpha * A X B + beta * C
 
         if alpha is not None:
-            A = bb.emit_te(topi.multiply, A, relax.const(alpha, dtype=dtype))
+            if transA:
+                A = relax.op.permute_dims(A)
+            if transB:
+                B = relax.op.permute_dims(B)
 
-        Y = bb.emit_te(topi.matmul, A, B, transA, transB)
+            Y = relax.op.multiply(
+                relax.op.linear_algebra.matmul(A, B),
+                relax.const(alpha, dtype=dtype),
+            )
 
         if C is not None:
             if beta is not None:
-                C = bb.emit_te(topi.multiply, C, relax.const(beta, dtype=dtype))
-            Y = bb.emit_te(topi.add, Y, C)
+                C = relax.op.multiply(C, relax.const(beta, dtype=dtype))
+            if alpha is not None:
+                Y = relax.op.add(Y, C)
+            else:
+                Y = C
 
-        return Y
+        return bb.emit(Y)
 
 
 class Reshape(OnnxOpConverter):
