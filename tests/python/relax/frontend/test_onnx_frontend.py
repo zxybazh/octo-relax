@@ -64,6 +64,252 @@ def generate_random_inputs(
     return input_values
 
 
+from typing import Dict, List, Callable, Tuple, Optional
+import numpy as np
+import onnx
+import onnxruntime as ort
+import onnx_graphsurgeon as gs
+import logging
+
+import tvm
+from tvm.ir import IRModule
+from tvm import relax, tir, te
+
+from tvm.relax import BlockBuilder, struct_info
+from tvm.relax.analysis import remove_all_unused
+from tvm.relax.expr import Call, Function, ShapeExpr, Expr
+from tvm.relax.expr_functor import mutator, PyExprMutator
+
+LegalizeFunc = Callable[[BlockBuilder, Call], Expr]
+
+
+def _matmul(bb: BlockBuilder, call: Call) -> Expr:
+    def te_matmul(a: te.Tensor, b: te.Tensor) -> te.Tensor:
+        a_shape = list(a.shape)
+        b_shape = list(b.shape)
+        a_prepended = False
+        b_appended = False
+        if len(a_shape) == 1:
+            a_prepended = True
+            a_shape.insert(0, 1)
+        if len(b_shape) == 1:
+            b_appended = True
+            b_shape.append(1)
+
+        is_a_larger = len(a_shape) > len(b_shape)
+        offset = len(a_shape) - len(b_shape) if is_a_larger else len(b_shape) - len(a_shape)
+
+        a_relax = relax.Var("a", relax.TensorStructInfo(a.shape))
+        b_relax = relax.Var("b", relax.TensorStructInfo(b.shape))
+        f_infer_sinfo = call.op.get_attr("FInferStructInfo")
+        output_shape = f_infer_sinfo(relax.op.matmul(a_relax, b_relax), bb).shape
+
+        def matmul_compute(*idx_spatial):
+            k = te.reduce_axis((0, a_shape[-1]), name="k")
+
+            def multiply_compute(idx_reduce):
+                a_indices = []
+                b_indices = []
+
+                for i in range(offset):
+                    if is_a_larger:
+                        a_indices.append(idx_spatial[i])
+                    else:
+                        b_indices.append(idx_spatial[i])
+                for i in range(offset, len(output_shape) - (2 - a_prepended - b_appended)):
+                    a_dim = a_shape[i if is_a_larger else i - offset]
+                    b_dim = b_shape[i if not is_a_larger else i - offset]
+                    a_dim_is_one = isinstance(a_dim, tir.IntImm) and a_dim == 1
+                    b_dim_is_one = isinstance(b_dim, tir.IntImm) and b_dim == 1
+                    a_indices.append(0 if a_dim_is_one else idx_spatial[i])
+                    b_indices.append(0 if b_dim_is_one else idx_spatial[i])
+                if not a_prepended:
+                    a_indices.append(idx_spatial[-2 + b_appended])
+                a_indices.append(idx_reduce)
+                b_indices.append(idx_reduce)
+                if not b_appended:
+                    b_indices.append(idx_spatial[-1])
+
+                dtype = call.attrs.out_dtype
+                if dtype != "":
+                    return a(*a_indices).astype(dtype) * b(*b_indices).astype(dtype)
+                else:
+                    return a(*a_indices) * b(*b_indices)
+
+            return te.sum(multiply_compute(k), axis=k)
+
+        return te.compute(
+            output_shape,
+            lambda *idx: matmul_compute(*idx),  # pylint: disable=unnecessary-lambda
+            name="matmul",
+        )
+
+    return bb.call_te(te_matmul, call.args[0], call.args[1], primfunc_name_hint="matmul")
+
+
+DEFAULT_OP_LEGALIZE_MAP: Dict[str, LegalizeFunc] = {
+    "relax.matmul": _matmul,
+}
+
+
+def has_known_shape_value(sinfo: struct_info.StructInfo) -> bool:
+    """Check if a given Tensor/Shape/TupleStructInfo contains
+    shapes whose values are all known.
+    Parameters
+    ----------
+    sinfo : struct_info.StructInfo
+        The struct info to be checked.
+    Returns
+    -------
+    ret : bool
+        A boolean indicating if the given struct info contains shape
+        values that are all known.
+    """
+    if isinstance(sinfo, struct_info.TensorStructInfo):
+        return isinstance(sinfo.shape, ShapeExpr)
+    elif isinstance(sinfo, struct_info.ShapeStructInfo):
+        return sinfo.values is not None
+    elif isinstance(sinfo, struct_info.TupleStructInfo):
+        return all([has_known_shape_value(field_sinfo) for field_sinfo in sinfo.fields])
+    elif isinstance(sinfo, struct_info.PrimStructInfo):
+        return True
+    else:
+        return False
+
+
+@tvm.transform.module_pass(opt_level=3, name="LegalizeOps")
+class LegalizeOps:
+    """Legalize high-level operator calls in Relax functions to call_tir
+    with corresponding low-level TIR PrimFuncs.
+    For each high-level operator, we register the way of legalizing it as a
+    function, which takes a context BlockBuilder and the Call being legalized
+    as input, and returns the legalized call. Here the input BlockBuilder is
+    mainly used for adding the PrimFunc created by call_te into the context
+    IRModule.
+    The legalization function for each operator is registered in a map,
+    where the operator name is the key. The default legalization functions
+    are in the map `DEFAULT_OP_LEGALIZE_MAP`.
+    This pass provides customizability for users to use their own legalization
+    function for operators. The pass takes an optional customized map,
+    which has the same key/value type as the default map (see `LegalizeFunc`),
+    from users. When an operator is contained in both the default map and the
+    customized map, the default legalization function will be overridden, and
+    only the customized one will be used.
+    Parameters
+    ----------
+    customize_legalize_map : Optional[Dict[str, LegalizeFunc]]
+        The customized operator legalization function map.
+        If not specified, it will be a fresh empty dict.
+        If an op has legalization function in both the default map and the
+        customized map, the customized function will override the default
+        one.
+    Examples
+    --------
+    The following code shows how to use this pass:
+    .. code-block:: python
+        # Define the pass input IRModule
+        @tvm.script.ir_module
+        class Module:
+            @R.function
+            def main(
+                x: R.Tensor((2, 3), "float32"), y: R.Tensor((2, 3), "float32")
+            ) -> R.Tensor((2, 3), "float32"):
+                z: R.Tensor((2, 3), "float32") = R.add(x, y)
+                r: R.Tensor((2, 3), "float32") = R.multiply(y, z)
+                return r
+        # Define the customized legalization function for "relax.add"
+        def customize_legalize_add(bb: relax.BlockBuilder, call: relax.Call) -> relax.Expr:
+            from tvm import topi
+            return bb.call_te(topi.add, call.args[1], call.args[0])
+        # Apply the pass with the customized function to the module.
+        mod = LegalizeOps({"relax.add": customize_legalize_add})(Module)
+    Print out the result by `mod.show()`, we can see the IRModule after
+    legalization becomes
+    .. code-block:: python
+        @tvm.script.ir_module
+        class Module:
+            @R.function
+            def main(
+                x: R.Tensor((2, 3), "float32"), y: R.Tensor((2, 3), "float32")
+            ) -> R.Tensor((2, 3), "float32"):
+                z = R.call_tir(add, (y, x), (2, 3), dtype="float32")
+                r = R.call_tir(multiply, (y, z), (2, 3), dtype="float32")
+                return r
+            @T.prim_func
+            def add(
+                A: T.Buffer[(2, 3), "float32"],
+                B: T.Buffer[(2, 3), "float32"],
+                T_add: T.Buffer[(2, 3), "float32"],
+            ):
+                T.func_attr({"tir.noalias": True})
+                for ax0, ax1 in T.grid(2, 3):
+                    with T.block("T_add"):
+                        v_ax0, v_ax1 = T.axis.remap("SS", [ax0, ax1])
+                        T.reads(A[v_ax0, v_ax1], B[v_ax0, v_ax1])
+                        T.writes(T_add[v_ax0, v_ax1])
+                        T_add[v_ax0, v_ax1] = A[v_ax0, v_ax1] + B[v_ax0, v_ax1]
+            @T.prim_func
+            def multiply(
+                A: T.Buffer[(2, 3), "float32"],
+                B: T.Buffer[(2, 3), "float32"],
+                T_multiply: T.Buffer[(2, 3), "float32"],
+            ):
+                T.func_attr({"tir.noalias": True})
+                for ax0, ax1 in T.grid(2, 3):
+                    with T.block("T_multiply"):
+                        v_ax0, v_ax1 = T.axis.remap("SS", [ax0, ax1])
+                        T.reads(A[v_ax0, v_ax1], B[v_ax0, v_ax1])
+                        T.writes(T_multiply[v_ax0, v_ax1])
+                        T_multiply[v_ax0, v_ax1] = A[v_ax0, v_ax1] * B[v_ax0, v_ax1]
+    """
+
+    def __init__(self, customize_legalize_map: Optional[Dict[str, LegalizeFunc]] = None):
+        if customize_legalize_map is None:
+            self.customize_legalize_map = dict()
+        else:
+            self.customize_legalize_map = customize_legalize_map
+
+    def transform_module(self, mod: IRModule, ctx: tvm.transform.PassContext) -> IRModule:
+        @mutator
+        class OperatorLegalizer(PyExprMutator):
+            def __init__(self, mod: IRModule, customize_legalize_map: Dict[str, LegalizeFunc]):
+                super().__init__(mod)
+                self.mod = mod
+                self.legalize_map = DEFAULT_OP_LEGALIZE_MAP.copy()
+                for name, func in customize_legalize_map.items():
+                    self.legalize_map[name] = func
+
+            def _convert_op(self, call: Call) -> Expr:
+                if call.op.name in self.legalize_map:
+                    # We only transform the op calls with known shape values
+                    if not all(
+                        [has_known_shape_value(arg.struct_info) for arg in call.args]
+                    ) or not has_known_shape_value(call.struct_info):
+                        return call
+                    return self.legalize_map[call.op.name](self.builder_, call)
+                if call.op.name != "relax.call_tir":
+                    logging.warning("No legalization func for %s is found.", call.op.name)
+                return call
+
+            def transform(self) -> IRModule:
+                for global_var, func in self.mod.functions.items():
+                    if not isinstance(func, Function):
+                        continue
+                    updated_func = self.visit_expr(func)
+                    updated_func = remove_all_unused(updated_func)
+                    self.builder_.update_func(global_var, updated_func)
+
+                return self.builder_.get()
+
+            def visit_call_(self, call):  # pylint: disable=arguments-differ
+                call = self.visit_expr_post_order(call)
+                if not isinstance(call.op, tir.op.Op):
+                    return call
+                return self._convert_op(call)
+
+        return OperatorLegalizer(mod, self.customize_legalize_map).transform()
+
+
 def check_correctness(
     model: ModelProto, inputs: Optional[Dict[str, np.array]] = None, opset: int = None
 ) -> None:
@@ -92,6 +338,9 @@ def check_correctness(
 
     # Convert the onnx model into relax through the onnx importer.
     tvm_model = relax.from_onnx(model, opset=opset)
+    tvm_model.show()
+    with tvm.transform.PassContext(opt_level=3):
+        tvm_model = LegalizeOps()(tvm_model)  # pylint: disable=not-callable
     # Compile the relax graph into a VM then run.
     with tvm.transform.PassContext(opt_level=3):
         # TODO add target configuration.
@@ -554,14 +803,14 @@ def test_pow():
 
 def test_erf():
     erf_node = helper.make_node("Erf", ["x"], ["y"])
-    shape = [32, 32]
+    shape = [32, 6, 6]
     graph = helper.make_graph(
         [erf_node],
         "erf_test",
         inputs=[
-            helper.make_tensor_value_info("x", TensorProto.FLOAT, shape),
+            helper.make_tensor_value_info("x", TensorProto.FLOAT16, shape),
         ],
-        outputs=[helper.make_tensor_value_info("y", TensorProto.FLOAT, shape)],
+        outputs=[helper.make_tensor_value_info("y", TensorProto.FLOAT16, shape)],
     )
 
     model = helper.make_model(graph, producer_name="erf_test")
