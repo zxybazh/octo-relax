@@ -88,3 +88,5 @@ from .struct_info import (
 
 # pipeline
 from .pipeline import get_pipeline
+
+from .frontend.onnx_frontend import from_onnx
