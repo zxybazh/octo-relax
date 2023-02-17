@@ -532,6 +532,7 @@ class VMShapeLowerMutator
     // the shape_func to indicate that this is a host function
     // This could require us to attach target to the relax function here.
     tir::PrimFunc shape_func(params, body, ret_type, buffer_map);
+    shape_func = WithAttr<tir::PrimFunc>(std::move(shape_func), tvm::tir::attr::kIsHostFunc, Integer(1));
     GlobalVar shape_func_var = builder_->AddFunction(shape_func, "shape_func");
     builder_->Emit(Call(shape_func_var, {shape_heap_}), "_");
     return to_compute.size();
