@@ -347,6 +347,28 @@ class ReduceMean(OnnxOpConverter):
         return bb.normalize(relax.op.mean(inputs[0], axes, keepdims))
 
 
+class ReduceL2(OnnxOpConverter):
+    """Convert an onnx ReduceL2 node into an equivalent Relax expression."""
+
+    @classmethod
+    def _impl_v18(cls, bb, inputs, attr):
+        noop_with_empty_axes = attr.get("noop_with_empty_axes", 0)
+        keepdims = attr.get("keepdims", 1)
+
+        data = inputs[0]
+        if len(inputs) == 2:
+            axes = inputs[1]
+        else:
+            if noop_with_empty_axes:
+                return bb.normalize(data)
+            else:
+                axes = list(range(len(data.struct_info.shape)))
+
+        square = bb.normalize(relax.op.multiply(data, data))
+        sum = bb.normalize(relax.op.sum(square, axes, keepdims))
+        return bb.normalize(relax.op.sqrt(sum))
+
+
 class Sigmoid(OnnxOpConverter):
     """Convert an onnx Sigmoid node into an equivalent Relax expression."""
 
@@ -522,6 +544,40 @@ class Pow(OnnxOpConverter):
         return bb.normalize(relax.op.exp(relax.op.multiply(relax.op.log(x), y)))
 
 
+class LayerNormalization(OnnxOpConverter):
+    """Convert an onnx LayerNormalization node into an equivalent Relax expression."""
+
+    @classmethod
+    def _impl_v17(cls, bb, inputs, attr):
+        x = inputs[0]
+        gamma = inputs[1]
+        beta = inputs[2]
+        axis = attr.get("axis", -1)
+        epsilon = attr.get("epsilon", 1e-5)
+        # according to the onnx doc, given the int axis (default -1)
+        # to compute the mean and inv_stdev which are of dim [d[0], ..., d[axis-1], 1, ..., 1]
+        # the actual computation is over (axis, ..., rank(x) - 1) axes
+        # see https://github.com/onnx/onnx/blob/main/docs/Changelog.md#layernormalization-17
+        rank = x.checked_type.ndim
+        axis = tuple(range(axis, rank)) if axis >= 0 else tuple(range(rank + axis, rank))
+        dtype = x.checked_type.dtype
+        mean = bb.normalize(relax.op.mean(x, axis=axis, keepdims=True))
+        var = bb.normalize(relax.op.variance(x, axis=axis, keepdims=True))
+        inv_stdev = bb.normalize(
+            relax.op.divide(
+                relax.const(1, dtype=dtype),
+                relax.op.sqrt(relax.op.add(var, relax.const(epsilon, dtype=dtype))),
+            )
+        )
+
+        x_norm = bb.normalize(relax.op.multiply(relax.op.subtract(x, mean), inv_stdev))
+        ln = bb.normalize(relax.op.multiply(x_norm, gamma))
+        if beta is not None:
+            ln = bb.normalize(relax.op.add(ln, beta))
+
+        return relax.Tuple([ln, mean, inv_stdev])
+
+
 class SkipLayerNormalization(OnnxOpConverter):
     """Convert an onnx SkipLayerNormalization node into an equivalent Relax expression."""
 
@@ -622,6 +678,38 @@ class Constant(OnnxOpConverter):
         dtype = np_value.dtype.name
         value = relax.const(np_value, dtype)
         return value
+
+
+class ConstantOfShape(OnnxOpConverter):
+    """Convert an onnx ConstantOfShape node into an equivalent Relax expression."""
+
+    @classmethod
+    def _impl_v9(cls, bb, inputs, attr):
+        shape = inputs[0]
+
+        if "value" in attr:
+            np_value = get_numpy(attr.pop("value"))[0]
+            value = relax.const(np_value, dtype=np_value.dtype.name)
+            dtype = np_value.dtype.name
+        else:
+            value = relax.const(0, dtype="float32")
+            dtype = "float32"
+
+        shape_ndim = [dim.value for dim in shape.struct_info.shape.values][0]
+        shape_dataflow_var = bb.emit(
+            relax.Call(
+                relax.ExternFunc("vm.builtin.tensor_to_shape"),
+                [shape],
+                sinfo_args=[relax.ShapeStructInfo(ndim=shape_ndim)],
+            )
+        )
+
+        shape_vars = []
+        for i in range(shape_ndim):
+            shape_vars.append(tvm.tir.Var("shape_var_%d" % i, "int64"))
+        # TODO: confirm this is the correct way to do this
+        bb.match_cast(shape_dataflow_var, R.Shape(shape_vars))
+        return bb.normalize(relax.op.full(relax.ShapeExpr(shape_vars), value, dtype))
 
 
 class Relu(OnnxOpConverter):
@@ -867,6 +955,7 @@ def _get_convert_map():
         "Div": Div,
         "Expand": Expand,
         "ReduceMean": ReduceMean,
+        "ReduceL2": ReduceL2,
         "Sigmoid": Sigmoid,
         "Slice": Slice,
         "Softmax": Softmax,
@@ -885,9 +974,11 @@ def _get_convert_map():
         "Tanh": Tanh,
         "Where": Where,
         "Constant": Constant,
+        "ConstantOfShape": ConstantOfShape,
         "Relu": Relu,
         "Split": Split,
         "EmbedLayerNormalization": EmbedLayerNormalization,
+        "LayerNormalization": LayerNormalization,
         "Attention": Attention,
     }
 

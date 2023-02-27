@@ -1663,6 +1663,18 @@ class ReduceMeanModule__1_2_3_4__0_1_2_3__1:
 
 
 @tvm.script.ir_module
+class ReduceL2Module:
+    @R.function
+    def main(data: R.Tensor((24, 32, 32, 8), dtype="float32")) -> R.Tensor((), dtype="float32"):
+        with R.dataflow():
+            lv: R.Tensor((24, 32, 32, 8), dtype="float32") = R.multiply(data, data)
+            lv1: R.Tensor((), dtype="float32") = R.sum(lv, axis=[0, 1, 2, 3], keepdims=False)
+            gv: R.Tensor((), dtype="float32") = R.sqrt(lv1)
+            R.output(gv)
+        return gv
+
+
+@tvm.script.ir_module
 class SigmoidModule:
     @R.function
     def main(
@@ -2040,6 +2052,39 @@ class EmbedLayerNormModule:
         return gv
 
 
+@tvm.script.ir_module
+class LayerNormModule:
+    @R.function
+    def main(
+        input: R.Tensor((3, 4, 5), dtype="float32"),
+        gamma: R.Tensor((5,), dtype="float32"),
+        beta: R.Tensor((5,), dtype="float32"),
+    ) -> R.Tuple(
+        R.Tensor((3, 4, 5), dtype="float32"),
+        R.Tensor((3, 4, 1), dtype="float32"),
+        R.Tensor((3, 4, 1), dtype="float32"),
+    ):
+        with R.dataflow():
+            lv: R.Tensor((3, 4, 1), dtype="float32") = R.variance(input, axis=[2], keepdims=True)
+            lv1: R.Tensor((3, 4, 1), dtype="float32") = R.add(
+                lv, R.const(9.9999997473787516e-06, "float32")
+            )
+            lv2: R.Tensor((3, 4, 1), dtype="float32") = R.sqrt(lv1)
+            lv3: R.Tensor((3, 4, 1), dtype="float32") = R.mean(input, axis=[2], keepdims=True)
+            lv4: R.Tensor((3, 4, 5), dtype="float32") = R.subtract(input, lv3)
+            lv5: R.Tensor((3, 4, 1), dtype="float32") = R.divide(R.const(1, "float32"), lv2)
+            lv6: R.Tensor((3, 4, 5), dtype="float32") = R.multiply(lv4, lv5)
+            lv7: R.Tensor((3, 4, 5), dtype="float32") = R.multiply(lv6, gamma)
+            lv8: R.Tensor((3, 4, 5), dtype="float32") = R.add(lv7, beta)
+            gv: R.Tuple(
+                R.Tensor((3, 4, 5), dtype="float32"),
+                R.Tensor((3, 4, 1), dtype="float32"),
+                R.Tensor((3, 4, 1), dtype="float32"),
+            ) = (lv8, lv3, lv5)
+            R.output(gv)
+        return gv
+
+
 # pylint: enable=no-self-argument,missing-class-docstring,missing-function-docstring,invalid-name
 
 
@@ -2375,6 +2420,27 @@ def test_reduce_mean(input_shape: List[int], axes: List[int], keepdims: int):
     )
 
 
+def test_reduce_l2():
+    """Test case for reduce_l2 op."""
+    reduce_l2_node = helper.make_node("ReduceL2", ["data"], ["reduced"], axes=[0, 1, 2], keepdims=0)
+
+    graph = helper.make_graph(
+        [reduce_l2_node],
+        "reduce_l2_test",
+        inputs=[
+            helper.make_tensor_value_info(
+                "data",
+                TensorProto.FLOAT,
+                [24, 32, 32, 8],
+            ),
+        ],
+        outputs=[helper.make_tensor_value_info("reduced", TensorProto.FLOAT, [8])],
+    )
+
+    model = helper.make_model(graph, producer_name="reduce_l2_test")
+    assert tvm.ir.structural_equal(relax.from_onnx(model), ReduceL2Module)
+
+
 def test_sigmoid():
     """Test case for sigmoid op."""
     sigmoid_node = helper.make_node("Sigmoid", ["data"], ["sigmoid"])
@@ -2665,6 +2731,31 @@ def test_skip_layer_normalization():
     assert tvm.ir.structural_equal(relax.from_onnx(model), SkipLayerNormModule)
 
 
+def test_layer_normalization():
+    """Test case for layer_normalization op."""
+    layer_normalization_node = helper.make_node(
+        "LayerNormalization", ["input", "gamma", "beta"], ["y", "mean", "inv_std_var"], epsilon=1e-5
+    )
+
+    graph = helper.make_graph(
+        [layer_normalization_node],
+        "layer_normalization_test",
+        inputs=[
+            helper.make_tensor_value_info("input", TensorProto.FLOAT, [3, 4, 5]),
+            helper.make_tensor_value_info("gamma", TensorProto.FLOAT, [5]),
+            helper.make_tensor_value_info("beta", TensorProto.FLOAT, [5]),
+        ],
+        outputs=[
+            helper.make_tensor_value_info("y", TensorProto.FLOAT, [3, 4, 5]),
+            helper.make_tensor_value_info("mean", TensorProto.FLOAT, [5]),
+            helper.make_tensor_value_info("inv_std_var", TensorProto.FLOAT, [5]),
+        ],
+    )
+
+    model = helper.make_model(graph, producer_name="layer_normalization_test")
+    assert tvm.ir.structural_equal(relax.from_onnx(model), LayerNormModule)
+
+
 def test_squeeze():
     """Test case for squeeze op."""
     squeeze_node = helper.make_node("Squeeze", ["a", "axes"], ["b"])
@@ -2770,6 +2861,46 @@ def test_const():
     #             gv: R.Tensor((32, 16), dtype="float32") = metadata["relax.expr.Constant"][0]
     #             R.output(gv)
     #         return gv
+
+
+def test_constant_of_shape():
+    """Test case for constant_of_shape op."""
+    shape = [32, 16]
+    const_node = helper.make_node(
+        "ConstantOfShape",
+        ["shape"],
+        ["output"],
+        value=helper.make_tensor("value", TensorProto.FLOAT, [1], [1.0]),
+    )
+    graph = helper.make_graph(
+        [const_node],
+        "const_test",
+        inputs=[],
+        outputs=[helper.make_tensor_value_info("output", TensorProto.FLOAT, shape)],
+        initializer=[
+            helper.make_tensor("shape", TensorProto.INT64, [2], shape),
+        ],
+    )
+
+    model = helper.make_model(graph, producer_name="const_test")
+    mod = relax.from_onnx(model)
+
+    # pylint: off
+    # TODO: figure out how to get metadata to work with Relax TVMScript
+    # @tvm.script.ir_module
+    # class ConstantOfShapeModule:
+    #     @R.function
+    #     def main() -> R.Tensor(dtype="float32", ndim=2):
+    #         shape_var_0 = T.Var("shape_var_0", "int64")
+    #         shape_var_1 = T.Var("shape_var_1", "int64")
+    #         with R.dataflow():
+    #             lv: R.Shape(ndim=2) = R.call_packed("vm.builtin.tensor_to_shape", metadata["relax.expr.Constant"][0], sinfo_args=(R.Shape(ndim=2),))
+    #             lv1: R.Shape([shape_var_0, shape_var_1]) = R.match_cast(lv, R.Shape([shape_var_0, shape_var_1]))
+    #             gv: R.Tensor((shape_var_0, shape_var_1), dtype="float32") = R.full(R.shape([shape_var_0, shape_var_1]), R.const(1, "float32"), dtype="float32")
+    #             R.output(gv)
+    #         return gv
+    # assert tvm.ir.structural_equal(mod, ConstantOfShapeModule)
+    # pylint: on
 
 
 def test_relu():
