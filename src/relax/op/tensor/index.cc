@@ -178,8 +178,39 @@ StructInfo InferStructInfoStridedSlice(const Call& call, const BlockBuilder& ctx
 
   Array<PrimExpr> output_shape = data_shape->values;
   for (int i = 0; i < n_axis; ++i) {
-    PrimExpr len = int_strides[i] < 0 ? ceildiv(attrs->begin[i] - attrs->end[i], -int_strides[i])
-                                      : ceildiv(attrs->end[i] - attrs->begin[i], int_strides[i]);
+    int64_t begin = Downcast<IntImm>(attrs->begin[i])->value;
+    int64_t end = Downcast<IntImm>(attrs->end[i])->value;
+    int64_t ndim = data_shape->values[axes[i]].as<IntImmNode>()->value;
+    if (begin < -ndim) {
+      if (int_strides[i] < 0) {
+        begin = end;
+      } else {
+        begin = -ndim + int_strides[i] - (-ndim - begin - 1) % int_strides[i] - 1;
+      }
+    }
+    if (begin >= ndim) {
+      if (int_strides[i] < 0) {
+        begin = ndim - 1 + int_strides[i] + (begin - ndim) % -int_strides[i] + 1;
+      } else {
+        begin = end;
+      }
+    }
+    if (end < -ndim) {
+      if (int_strides[i] < 0) {
+        end = -ndim;
+      } else {
+        end = begin;
+      }
+    }
+    if (end >= ndim) {
+      if (int_strides[i] < 0) {
+        end = begin;
+      } else {
+        end = ndim;
+      }
+    }
+    PrimExpr len = int_strides[i] < 0 ? ceildiv(begin - end, -int_strides[i])
+                                      : ceildiv(end - begin, int_strides[i]);
     output_shape.Set(axes[i], len);
   }
   return TensorStructInfo(ShapeExpr(output_shape), data_sinfo->dtype);
